@@ -8,6 +8,8 @@ import tempfile
 import traceback
 import tomllib
 import tomli_w
+import time
+import threading
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 import glob
@@ -24,6 +26,21 @@ else:
 
 IDA_HOST = "127.0.0.1"
 IDA_PORT = 13337
+HTTP_LOG_PATH = os.environ.get("IDA_MCP_HTTP_LOG", "").strip()
+HTTP_LOG_LOCK = threading.Lock()
+
+
+def _log_http(message: str):
+    if not HTTP_LOG_PATH:
+        return
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{ts} [ida-pro-mcp] {message}\n"
+        with HTTP_LOG_LOCK:
+            with open(HTTP_LOG_PATH, "a", encoding="utf-8") as handle:
+                handle.write(line)
+    except Exception:
+        pass
 
 mcp = McpServer("ida-pro-mcp")
 dispatch_original = mcp.registry.dispatch
@@ -42,17 +59,24 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
         return dispatch_original(request)
 
     conn = http.client.HTTPConnection(IDA_HOST, IDA_PORT, timeout=30)
+    start = time.perf_counter()
     try:
         if isinstance(request, dict):
             request = json.dumps(request)
         elif isinstance(request, str):
             request = request.encode("utf-8")
+        payload_len = len(request)
+        _log_http(f"--> {request_obj.get('method')} id={request_obj.get('id')} bytes={payload_len}")
         conn.request("POST", "/mcp", request, {"Content-Type": "application/json"})
         response = conn.getresponse()
         data = response.read().decode()
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        _log_http(f"<-- {request_obj.get('method')} id={request_obj.get('id')} status={response.status} bytes={len(data)} elapsed_ms={elapsed_ms:.1f}")
         return json.loads(data)
     except Exception as e:
         full_info = traceback.format_exc()
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        _log_http(f"!! {request_obj.get('method')} id={request_obj.get('id')} error={type(e).__name__} elapsed_ms={elapsed_ms:.1f} {e}")
         id = request_obj.get("id")
         if id is None:
             return None  # Notification, no response needed

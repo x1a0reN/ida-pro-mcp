@@ -4,8 +4,10 @@ import functools
 import os
 import sys
 import time
+import threading
 import idaapi
 import idc
+import ida_pro
 from .rpc import McpToolError
 from .zeromcp.jsonrpc import get_current_cancel_event, RequestCancelledError
 
@@ -38,6 +40,65 @@ class CancelledError(RequestCancelledError):
 logger = logging.getLogger(__name__)
 _TOOL_TIMEOUT_ENV = "IDA_MCP_TOOL_TIMEOUT_SEC"
 _DEFAULT_TOOL_TIMEOUT_SEC = 15.0
+_HEADLESS_LOCK = threading.RLock()
+_HEADLESS_MODE = os.environ.get("IDA_MCP_HEADLESS_MODE", "").strip().lower()
+_HEADLESS_DIRECT = os.environ.get("IDA_MCP_FORCE_DIRECT", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+_HEADLESS_QUEUE: queue.Queue = queue.Queue()
+
+
+class _HeadlessCall:
+    def __init__(self, func):
+        self.func = func
+        self.event = threading.Event()
+        self.result = None
+        self.error = None
+
+
+def headless_pump(max_items: int = 1, timeout: float = 0.0) -> int:
+    """Run queued headless tool calls on the main thread."""
+    processed = 0
+    for _ in range(max_items):
+        try:
+            if timeout > 0 and processed == 0:
+                call = _HEADLESS_QUEUE.get(timeout=timeout)
+            else:
+                call = _HEADLESS_QUEUE.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            call.result = call.func()
+        except Exception as ex:
+            call.error = ex
+        finally:
+            call.event.set()
+        processed += 1
+    return processed
+
+
+def _is_headless() -> bool:
+    if _HEADLESS_DIRECT or _HEADLESS_MODE == "queue":
+        return True
+    try:
+        is_idat = getattr(idaapi, "is_idat", None)
+        if callable(is_idat) and is_idat():
+            return True
+        is_idaq = getattr(idaapi, "is_idaq", None)
+        if callable(is_idaq):
+            return not is_idaq()
+    except Exception:
+        return False
+    return False
+
+
+def _is_main_thread() -> bool:
+    try:
+        return ida_pro.is_main_thread()
+    except Exception:
+        return False
 
 
 def _get_tool_timeout_seconds() -> float:
@@ -129,7 +190,36 @@ def sync_wrapper(ff, timeout_override: float | None = None):
                 sys.setprofile(old_profile)
 
         timed_ff.__name__ = ff.__name__
+        if _is_headless():
+            if _HEADLESS_MODE == "queue":
+                if _is_main_thread():
+                    return _run_with_batch(timed_ff)()
+                call = _HeadlessCall(_run_with_batch(timed_ff))
+                _HEADLESS_QUEUE.put(call)
+                if timeout > 0:
+                    if not call.event.wait(timeout):
+                        raise IDASyncError(f"Tool timed out after {timeout:.2f}s")
+                else:
+                    call.event.wait()
+                if call.error:
+                    raise call.error
+                return call.result
+            with _HEADLESS_LOCK:
+                return _run_with_batch(timed_ff)()
         return _sync_wrapper(_run_with_batch(timed_ff))
+
+    if _is_headless():
+        if _HEADLESS_MODE == "queue":
+            if _is_main_thread():
+                return _run_with_batch(ff)()
+            call = _HeadlessCall(_run_with_batch(ff))
+            _HEADLESS_QUEUE.put(call)
+            call.event.wait()
+            if call.error:
+                raise call.error
+            return call.result
+        with _HEADLESS_LOCK:
+            return _run_with_batch(ff)()
     return _sync_wrapper(_run_with_batch(ff))
 
 
