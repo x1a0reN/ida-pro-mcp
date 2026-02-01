@@ -39,7 +39,7 @@ class CancelledError(RequestCancelledError):
 
 logger = logging.getLogger(__name__)
 _TOOL_TIMEOUT_ENV = "IDA_MCP_TOOL_TIMEOUT_SEC"
-_DEFAULT_TOOL_TIMEOUT_SEC = 15.0
+_DEFAULT_TOOL_TIMEOUT_SEC = 30.0
 _HEADLESS_LOCK = threading.RLock()
 _HEADLESS_MODE = os.environ.get("IDA_MCP_HEADLESS_MODE", "").strip().lower()
 _HEADLESS_DIRECT = os.environ.get("IDA_MCP_FORCE_DIRECT", "").strip().lower() in (
